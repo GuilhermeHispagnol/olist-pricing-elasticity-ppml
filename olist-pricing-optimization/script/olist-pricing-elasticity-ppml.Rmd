@@ -1,0 +1,386 @@
+---
+title: "olist-pricing-elasticity-ppml"
+author: "Guilherme Henrique Hispagol Bicho"
+date: "2026-04-02"
+output: html_document
+---
+```{r message=FALSE, warning=FALSE, include=FALSE}
+library(dplyr)
+library(readr)
+library(lubridate)
+library(fixest)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+
+# ==============================================================================
+# 2. CARREGAMENTO DOS DADOS E DIRETÓRIOS
+# ==============================================================================
+# Caminhos de entrada (dados brutos)
+caminho_items    <- "/home/guilhermeh/Documentos/Projeto Elasticidade/archive/olist_order_items_dataset.csv"
+caminho_orders   <- "/home/guilhermeh/Documentos/Projeto Elasticidade/archive/olist_orders_dataset.csv"
+caminho_products <- "/home/guilhermeh/Documentos/Projeto Elasticidade/archive/olist_products_dataset.csv"
+
+# Caminho de saída (onde os gráficos e tabelas serão salvos)
+dir_output <- "/home/guilhermeh/Documentos/Projeto Elasticidade/olist-pricing-optimization/outputs/"
+
+# Cria a pasta de outputs caso ela ainda não exista
+if (!dir.exists(dir_output)) {
+  dir.create(dir_output, recursive = TRUE)
+}
+
+df_items    <- read_csv(caminho_items, show_col_types = FALSE)
+df_orders   <- read_csv(caminho_orders, show_col_types = FALSE)
+df_products <- read_csv(caminho_products, show_col_types = FALSE)
+```
+
+
+```{r setup, echo=TRUE}
+# ==============================================================================
+# PROJETO: OTIMIZAÇÃO DE PRICING E ELASTICIDADE NA OLIST
+# ==============================================================================
+
+# ==============================================================================
+# 1. PACOTES E BIBLIOTECAS
+# ==============================================================================
+# install.packages(c("dplyr", "readr", "lubridate", "fixest", "purrr", "ggplot2", "tidyr"))
+
+library(dplyr)
+library(readr)
+library(lubridate)
+library(fixest)
+library(purrr)
+library(ggplot2)
+library(tidyr)
+
+# ==============================================================================
+# 3. DATA WRANGLING (CRIAÇÃO DO PAINEL POR CATEGORIA)
+# ==============================================================================
+df_painel_cat <- df_items %>%
+  inner_join(df_orders, by = "order_id") %>%
+  inner_join(df_products, by = "product_id") %>%
+  filter(!is.na(product_category_name)) %>%
+  mutate(ano_mes = floor_date(order_purchase_timestamp, "month")) %>%
+  group_by(product_category_name, product_id, ano_mes) %>%
+  summarise(
+    quantidade = n(),
+    preco_medio = mean(price, na.rm = TRUE),
+    frete_medio = mean(freight_value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ln_preco = log(preco_medio),
+    ln_frete = log(frete_medio + 1)
+  ) %>%
+  arrange(product_category_name, product_id, ano_mes) %>%
+  group_by(product_id) %>%
+  mutate(ln_preco_lag1 = lag(ln_preco, 1)) %>%
+  filter(!is.na(ln_preco_lag1)) %>%
+  filter(n() > 1) %>%
+  ungroup()
+
+# Isolar as Top 10 Categorias por volume
+top_10_categorias <- df_painel_cat %>%
+  count(product_category_name, sort = TRUE) %>%
+  slice_head(n = 10) %>%
+  pull(product_category_name)
+
+df_top_cat <- df_painel_cat %>%
+  filter(product_category_name %in% top_10_categorias)
+
+# ==============================================================================
+# 3.5. ANÁLISE EXPLORATÓRIA DE DADOS (EDA)
+# ==============================================================================
+cat("\n[Extra] Gerando Gráficos de Análise Exploratória (EDA)...\n")
+
+# ---------------------------------------------------------
+# Tabela EDA: Estatísticas Descritivas e Contagem de Outliers
+# ---------------------------------------------------------
+cat("\n=== TABELA DE ESTATÍSTICAS DESCRITIVAS ===\n")
+
+tabela_summary <- df_top_cat %>%
+  group_by(Categoria = product_category_name) %>%
+  summarise(
+    Qtd_Produtos_Unicos = n_distinct(product_id),
+    Total_Vendas_Unidades = sum(quantidade),
+    Preco_Min = round(min(preco_medio), 2),
+    Preco_Mediano = round(median(preco_medio), 2),
+    Preco_Medio = round(mean(preco_medio), 2),
+    Preco_Max = round(max(preco_medio), 2),
+    Desvio_Padrao = round(sd(preco_medio), 2),
+    
+    # --- Contar os Outliers (Regra de Tukey / Boxplot) ---
+    Q1 = quantile(preco_medio, 0.25),
+    Q3 = quantile(preco_medio, 0.75),
+    IQR = Q3 - Q1,
+    Limite_Superior = Q3 + 1.5 * IQR,
+    Limite_Inferior = Q1 - 1.5 * IQR,
+    
+    Qtd_Outliers = sum(preco_medio > Limite_Superior | preco_medio < Limite_Inferior),
+    Pct_Outliers_Perc = round((Qtd_Outliers / n()) * 100, 2),
+    
+    .groups = "drop"
+  ) %>%
+  select(-Q1, -Q3, -IQR, -Limite_Superior, -Limite_Inferior) %>% 
+  arrange(desc(Total_Vendas_Unidades))
+
+print(tabela_summary)
+write_csv(tabela_summary, paste0(dir_output, "eda_04_estatisticas_descritivas.csv"))
+
+# ---------------------------------------------------------
+# Gráfico EDA 1: Boxplot de Preços 
+# ---------------------------------------------------------
+grafico_outliers <- ggplot(df_top_cat, 
+                           aes(x = reorder(product_category_name, preco_medio,
+                                           FUN = median), 
+                               y = preco_medio, fill = product_category_name)) +
+  geom_boxplot(alpha = 0.7, outlier.color = "red",
+               outlier.shape = 4, outlier.size = 2) +
+  coord_flip() +
+  scale_fill_viridis_d(guide = "none") +
+  theme_minimal() +
+  labs(
+    title = "1. Distribuição de Preços por Categoria",
+    subtitle = "Pontos vermelhos mostram valores extremos.
+    \nIsso justifica o uso do logaritmo ln(Preço) no modelo.",
+    x = NULL, y = "Preço Médio (R$)"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        axis.text.y = element_text(face = "bold"))
+
+ggsave(paste0(dir_output, "eda_01_outliers_preco.png"), plot = grafico_outliers,
+       width = 10, height = 6, dpi = 300, bg = "white")
+
+# ---------------------------------------------------------
+# Gráfico EDA 2: Histograma da Demanda Justificando o PPML
+# ---------------------------------------------------------
+grafico_demanda <- ggplot(df_top_cat, aes(x = quantidade)) +
+  geom_histogram(binwidth = 1, fill = "#3498db", color = "black", alpha = 0.8) +
+  coord_cartesian(xlim = c(0, 50)) +
+  theme_minimal() +
+  labs(
+    title = "2. Distribuição da Quantidade Vendida (Cauda Longa)",
+    subtitle = "Forte assimetria à direita (a maioria vende 1 ou 2 unidades).
+    \nIsso prova que OLS falharia e PPML é ideal.",
+    x = "Quantidade Vendida por Mês (Por Produto)", y = "Frequência Absoluta"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+ggsave(paste0(dir_output, "eda_02_distribuicao_demanda.png"),
+       plot = grafico_demanda, width = 10, height = 6, dpi = 300, bg = "white")
+
+# ---------------------------------------------------------
+# Gráfico EDA 3: Sazonalidade Justificando o Efeito Fixo
+# ---------------------------------------------------------
+vendas_tempo <- df_top_cat %>%
+  group_by(ano_mes) %>%
+  summarise(vendas_totais = sum(quantidade), .groups = "drop")
+
+grafico_sazonalidade <- ggplot(vendas_tempo, aes(x = ano_mes, y = vendas_totais)) +
+  geom_line(color = "#2c3e50", linewidth = 1.2) +
+  geom_point(color = "#e74c3c", size = 4) +
+  scale_x_datetime(date_breaks = "2 months", date_labels = "%b %y") +
+  theme_minimal() +
+  labs(
+    title = "3. Sazonalidade das Vendas (O Efeito Black Friday/Natal)",
+    subtitle = "Variações bruscas no tempo provam a necessidade do Efeito
+    \nFixo de 'ano_mes' para não distorcer a elasticidade.",
+    x = "Mês/Ano", y = "Volume Total Vendido"
+  ) +
+  theme(plot.title = element_text(face = "bold", size = 14),
+        axis.text.x = element_text(angle = 45, hjust = 1, face = "bold"))
+
+ggsave(paste0(dir_output, "eda_03_sazonalidade_vendas.png"),
+       plot = grafico_sazonalidade, width = 10, height = 6, dpi = 300, bg = "white")
+
+# ==============================================================================
+# 4. MODELAGEM (ELASTICIDADE COM MÉTRICAS ESTATÍSTICAS COMPLETAS)
+# ==============================================================================
+cat("\n[1/3] Calculando Elasticidades e Métricas Completas de Avaliação...\n")
+
+tabela_elasticidade <- df_top_cat %>%
+  split(.$product_category_name) %>%
+  map_df(function(dados_categoria) {
+    tryCatch({
+      # Roda o modelo PPML
+      modelo <- fepois(
+        quantidade ~ ln_preco_lag1 + ln_frete | product_id + ano_mes,
+        data = dados_categoria,
+        cluster = ~product_id,
+        warn = FALSE, notes = FALSE
+      )
+      
+      # 1. Coeficientes, Erro Padrão e P-valor
+      elasticidade <- coef(modelo)["ln_preco_lag1"]
+      erro_padrao  <- se(modelo)["ln_preco_lag1"]
+      p_valor      <- pvalue(modelo)["ln_preco_lag1"]
+      
+      # 2. Intervalo de Confiança (Aproximação 95%: Coef +/- 1.96 * SE)
+      ci_inferior <- elasticidade - (1.96 * erro_padrao)
+      ci_superior <- elasticidade + (1.96 * erro_padrao)
+      
+      # 3. Métricas de Ajuste e Tamanho da Amostra
+      metricas  <- fitstat(modelo, c("pr2", "rmse", "aic", "bic"))
+      n_obs     <- nobs(modelo)
+      
+      tibble(
+        Categoria = unique(dados_categoria$product_category_name),
+        N_Obs = n_obs,
+        Elasticidade = round(elasticidade, 3),
+        SE = round(erro_padrao, 3),
+        CI_95_Inferior = round(ci_inferior, 3),
+        CI_95_Superior = round(ci_superior, 3),
+        P_Valor = round(p_valor, 4),
+        Status = ifelse(p_valor < 0.05, "Significativo", "Não Significativo"),
+        Pseudo_R2 = round(metricas$pr2, 4),
+        RMSE = round(metricas$rmse, 2),
+        AIC = round(metricas$aic, 1),
+        BIC = round(metricas$bic, 1)
+      )
+    }, error = function(e) { NULL })
+  })
+
+print("=== TABELA DE ELASTICIDADE COM MÉTRICAS COMPLETAS ===")
+print(tabela_elasticidade)
+
+# ==============================================================================
+# 5. SIMULADOR DE CENÁRIOS DE PRICING (COM BANDAS DE RISCO E INCERTEZA)
+# ==============================================================================
+cat("\n[2/3] Rodando Simulador de Receita com Regras de Inferência e Risco...\n")
+
+tabela_simulacao <- df_top_cat %>%
+  split(.$product_category_name) %>%
+  map_df(function(dados_categoria) {
+    
+    categoria_nome <- unique(dados_categoria$product_category_name)
+    
+    tryCatch({
+      elasticidade_info <- tabela_elasticidade %>% filter(Categoria == categoria_nome)
+      if (nrow(elasticidade_info) == 0) return(NULL)
+      
+      elast_val <- elasticidade_info$Elasticidade
+      ic_inf <- elasticidade_info$CI_95_Inferior
+      ic_sup <- elasticidade_info$CI_95_Superior
+      
+      # Usando Mediana ao invés de Média (Proteção contra Outliers)
+      preco_atual <- median(dados_categoria$preco_medio, na.rm = TRUE)
+      qtd_atual <- median(dados_categoria$quantidade, na.rm = TRUE)
+      receita_atual <- preco_atual * qtd_atual
+      
+      # Regra de Negócio baseada no Intervalo de Confiança 
+      if (ic_sup < -1) {
+        mudanca_preco_pct <- -0.10
+        acao <- "Dar Desconto (-10%)"
+      } else if (ic_inf > -1) {
+        mudanca_preco_pct <- 0.10
+        acao <- "Aumentar Preço (+10%)"
+      } else {
+        mudanca_preco_pct <- 0.00
+        acao <- "Manter Preço (Zona de Incerteza)"
+      }
+      
+      # Matemática da Simulação (Preço Novo)
+      preco_simulado <- preco_atual * (1 + mudanca_preco_pct)
+      
+      # O PULO DO GATO: Simulando a demanda nos 3 cenários (Base, IC Inferior, IC Superior)
+      qtd_base   <- qtd_atual * (1 + mudanca_preco_pct)^elast_val
+      qtd_bound1 <- qtd_atual * (1 + mudanca_preco_pct)^ic_inf
+      qtd_bound2 <- qtd_atual * (1 + mudanca_preco_pct)^ic_sup
+      
+      # Calculando as Receitas Simuladas
+      rec_base   <- preco_simulado * qtd_base
+      rec_bound1 <- preco_simulado * qtd_bound1
+      rec_bound2 <- preco_simulado * qtd_bound2
+      
+      # Calculando os Impactos Percentuais
+      impacto_base <- ((rec_base - receita_atual) / receita_atual) * 100
+      
+      # Pega o menor valor para o pior cenário e o maior para o melhor cenário
+      impacto_pessimista <- ((min(rec_bound1, rec_bound2) - receita_atual) / receita_atual) * 100
+      impacto_otimista   <- ((max(rec_bound1, rec_bound2) - receita_atual) / receita_atual) * 100
+      
+      tibble(
+        Categoria = categoria_nome,
+        Elasticidade = round(elast_val, 2),
+        Acao_Recomendada = acao,
+        Impacto_Pessimista = round(impacto_pessimista, 2),
+        Impacto_Base = round(impacto_base, 2),
+        Impacto_Otimista = round(impacto_otimista, 2)
+      )
+      
+    }, error = function(e) { NULL })
+  }) %>%
+  arrange(desc(Impacto_Base))
+
+print(tabela_simulacao)
+write_csv(tabela_simulacao, paste0(dir_output, "simulacao_pricing_olist.csv"))
+
+# ==============================================================================
+# 6. GRÁFICOS PARA O PORTFÓLIO
+# ==============================================================================
+cat("\n[3/3] Gerando Gráficos Finais...\n")
+
+# ---------------------------------------------------------
+# Gráfico 1: Diagnóstico (Elasticidade)
+# ---------------------------------------------------------
+grafico_diagnostico <- ggplot(tabela_elasticidade, 
+                              aes(x = Elasticidade,
+                                  y = reorder(Categoria, -Elasticidade),
+                                  fill = Status)) +
+  geom_col(color = "black", alpha = 0.85) +
+  geom_text(aes(label = round(Elasticidade, 2)), hjust = 1.2, color = "white",
+            fontface = "bold", size = 4) +
+  scale_fill_manual(values = c("Significativo" = "#2c3e50", 
+                               "Não Significativo" = "#95a5a6")) +
+  geom_vline(xintercept = -1, color = "#e74c3c",
+             linetype = "dashed", linewidth = 1) +
+  annotate("text", x = -0.95, y = 1.5,
+           label = "Limite Elástico (-1)", color = "#e74c3c", angle = 90,
+           fontface = "italic") +
+  labs(
+    title = "Sensibilidade a Preço por Categoria",
+    subtitle = "Quanto mais negativo, mais as vendas despencam com aumento de preços.",
+    x = "Elasticidade-Preço", y = NULL, fill = "Significância Estatística (p < 0.05)"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16), 
+        axis.text.y = element_text(size = 11, face = "bold"))
+
+print(grafico_diagnostico) 
+ggsave(paste0(dir_output, "01_elasticidade_olist.png"),
+       plot = grafico_diagnostico, width = 10, height = 6, dpi = 300, bg = "white")
+
+# ---------------------------------------------------------
+# Gráfico 2: Ação de Negócios (Impacto na Receita com Margem de Risco)
+# ---------------------------------------------------------
+grafico_impacto <- ggplot(tabela_simulacao, 
+                          aes(x = reorder(Categoria, Impacto_Base),
+                              y = Impacto_Base, fill = Acao_Recomendada)) +
+  geom_col(color = "black", alpha = 0.85) +
+  
+  # Adicionando as Barras de Erro (Incerteza/Risco)
+  geom_errorbar(aes(ymin = Impacto_Pessimista, ymax = Impacto_Otimista), 
+                width = 0.2, color = "black", linewidth = 0.7) +
+  
+  geom_text(aes(label = paste0(Impacto_Base, "%")),
+            hjust = -0.5, vjust = -0.5, color = "black", fontface = "bold", size = 3.5) +
+  
+  scale_fill_manual(values = c("Aumentar Preço (+10%)" = "#2ecc71",
+                               "Dar Desconto (-10%)" = "#3498db",
+                               "Manter Preço (Zona de Incerteza)" = "#bdc3c7")) +
+  coord_flip() +
+  labs(
+    title = "Impacto Estimado na Receita Mensal",
+    subtitle = "Barras pretas mostram a variação estatística de risco (Cenário Pessimista vs Otimista).",
+    x = NULL, y = "Crescimento da Receita (%)", fill = "Tática de Pricing Sugerida"
+  ) +
+  theme_minimal() +
+  theme(legend.position = "bottom", plot.title = element_text(face = "bold", size = 16), 
+        axis.text.y = element_text(size = 11, face = "bold"))
+
+print(grafico_impacto)
+ggsave(paste0(dir_output, "02_simulacao_impacto_receita.png"),
+       plot = grafico_impacto, width = 10, height = 6, dpi = 300, bg = "white")
+```
+
+

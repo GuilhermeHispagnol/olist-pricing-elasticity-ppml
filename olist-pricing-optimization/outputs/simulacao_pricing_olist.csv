@@ -1,0 +1,11 @@
+Categoria,Elasticidade,Acao_Recomendada,Impacto_Pessimista,Impacto_Base,Impacto_Otimista
+telefonia,-0.22,Aumentar Preço (+10%),0.7,7.71,15.2
+beleza_saude,-0.52,Manter Preço (Zona de Incerteza),0,0,0
+brinquedos,-1.09,Manter Preço (Zona de Incerteza),0,0,0
+cama_mesa_banho,-1.22,Manter Preço (Zona de Incerteza),0,0,0
+cool_stuff,-1.98,Manter Preço (Zona de Incerteza),0,0,0
+esporte_lazer,-0.84,Manter Preço (Zona de Incerteza),0,0,0
+informatica_acessorios,-0.43,Manter Preço (Zona de Incerteza),0,0,0
+moveis_decoracao,-1.6,Manter Preço (Zona de Incerteza),0,0,0
+relogios_presentes,-1.08,Manter Preço (Zona de Incerteza),0,0,0
+utilidades_domesticas,-0.4,Manter Preço (Zona de Incerteza),0,0,0
